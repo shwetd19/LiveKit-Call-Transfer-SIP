@@ -8,13 +8,68 @@ from livekit import api, rtc
 from livekit.protocol import sip as proto_sip
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
-        
-load_dotenv(dotenv_path=".env.local")
+def load_environment():
+    """
+    Load environment variables from available .env files
+    Returns True if successful, False if no environment files could be loaded
+    """
+    # Get the current script's directory
+    current_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+    
+    # Define potential env file locations
+    env_files = [
+        current_dir / '.env.local',
+        current_dir / '.env',
+        Path.home() / 'livekit-agent-inb/.env.local',
+        Path.home() / 'livekit-agent-inb/.env'
+    ]
+    
+    env_loaded = False
+    
+    # Try loading each env file in order
+    for env_file in env_files:
+        if env_file.exists():
+            try:
+                load_dotenv(dotenv_path=str(env_file))
+                logger.info(f"Loaded environment from: {env_file}")
+                env_loaded = True
+                break
+            except Exception as e:
+                logger.error(f"Error loading {env_file}: {str(e)}")
+                continue
+    
+    if not env_loaded:
+        logger.error("No environment files could be loaded!")
+        return False
+    
+    # Verify critical environment variables
+    required_vars = [
+        'LIVEKIT_URL',
+        'LIVEKIT_API_KEY',
+        'LIVEKIT_API_SECRET',
+        'OPENAI_API_KEY',
+        'BILLING_PHONE_NUMBER'
+    ]
+    
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        return False
+    
+    logger.info("Environment loaded successfully with all required variables")
+    return True
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# Replace the simple load_dotenv call with the new function
+if not load_environment():
+    logger.error("Failed to load required environment variables")
+    exit(1)
 
 # Simplified to just one department
 TRANSFER_CONFIG = {
@@ -57,34 +112,37 @@ async def handle_transfer(room_name: str, participant_identity: str, assistant: 
             api_secret=os.getenv('LIVEKIT_API_SECRET')
         )
 
-        # Format the transfer number with SIP URI format
-        transfer_uri = f"tel:{transfer_number}"
+        # Format the transfer number with SIP URI format and domain
+        transfer_uri = f"sip:{transfer_number}@sip.livekit.io"
         
-        # Create transfer request with proper SIP REFER format
-        transfer_request = proto_sip.TransferSIPParticipantRequest(
-            room_name=room_name,
-            participant_identity=participant_identity,
-            transfer_to=transfer_uri,
-            play_dialtone=False
-        )
+        logger.info(f"Preparing transfer request for {participant_identity} to {transfer_uri}")
+        
+        # Create transfer request with explicit parameters
+        transfer_request = proto_sip.TransferSIPParticipantRequest()
+        transfer_request.room_name = room_name
+        transfer_request.participant_identity = participant_identity
+        transfer_request.transfer_to = transfer_uri
 
-        logger.info(f"Initiating transfer for participant {participant_identity} to {transfer_uri}")
-        await livekit_api.sip.transfer_sip_participant(transfer_request)
+        logger.info(f"Executing transfer request: {transfer_request}")
         
-        # Wait briefly to ensure transfer is initiated
+        # Execute transfer and capture response
+        response = await livekit_api.sip.transfer_sip_participant(transfer_request)
+        logger.info(f"Transfer API response: {response}")
+        
+        # Wait for transfer to process
         await asyncio.sleep(2)
         
-        # Clean up and exit
+        # Stop the assistant before cleanup
+        await assistant.stop()
         await assistant.cleanup()
         
-        # Exit the process after transfer
-        logger.info("Transfer completed, exiting process")
-        os._exit(0)  # Force exit the process after transfer
+        logger.info("Transfer completed successfully")
         
-        return True
+        # Exit process after successful transfer
+        os._exit(0)
 
     except Exception as e:
-        logger.error(f"Transfer failed: {e}", exc_info=True)
+        logger.error(f"Transfer failed with exception: {str(e)}", exc_info=True)
         await assistant.say("I apologize, but I couldn't transfer your call. Please try again later.", allow_interruptions=True)
         return False
 
@@ -102,62 +160,109 @@ async def entrypoint(ctx: JobContext):
         ),
     )
 
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-
-    print(f"Room name is: {ctx.room.name}") 
-
-    organizationId = ctx.room.name.replace("call-","")
-    print(f"organizationId is: {organizationId}")
-    context = await fetch_context_from_organization_id(organizationId)
-    print(f"Context is: {context}")
-    initial_ctx.append(
-        role="system", 
-        text=(
-            context
-        ),
-    )
-    
-
-    # VoiceAssistant is a class that creates a full conversational AI agent.
+    # Create VoiceAssistant with explicit API key configuration
     assistant = VoiceAssistant(
         vad=silero.VAD.load(),
         stt=deepgram.STT(),
         llm=openai.LLM(),
         tts=openai.TTS(),
         chat_ctx=initial_ctx,
+        allow_interruptions=True,
+        interrupt_speech_duration=0.5,
+        min_endpointing_delay=0.5,
     )
 
-    assistant.start(ctx.room)
+    # Set up event handlers
+    def handle_user_speech(msg: llm.ChatMessage):
+        async def process_speech():
+            try:
+                logger.info(f"Processing user speech: {msg.content}")
+                
+                if isinstance(msg.content, list):
+                    message = " ".join(str(x) for x in msg.content if not isinstance(x, llm.ChatImage))
+                else:
+                    message = str(msg.content)
+                
+                message = message.lower().strip()
+                logger.info(f"Processed message: '{message}'")
+                
+                if message in ["yes", "yeah", "sure", "okay", "correct", "yep"]:
+                    logger.info("Positive response detected, initiating transfer")
+                    participants = list(ctx.room.participants.values())
+                    
+                    if not participants:
+                        logger.error("No participants found in room")
+                        await assistant.say("I'm sorry, but I cannot process the transfer at this moment.", allow_interruptions=True)
+                        return
 
+                    participant = participants[0]
+                    logger.info(f"Found participant: {participant.identity}")
+                    
+                    # Create transfer task
+                    transfer_task = asyncio.create_task(
+                        handle_transfer(ctx.room.name, participant.identity, assistant)
+                    )
+                    
+                    try:
+                        # Wait for transfer with timeout
+                        await asyncio.wait_for(transfer_task, timeout=15.0)
+                    except asyncio.TimeoutError:
+                        logger.error("Transfer operation timed out")
+                        await assistant.say("I'm sorry, the transfer is taking longer than expected. Please try again.", allow_interruptions=True)
+                    except Exception as e:
+                        logger.error(f"Transfer task failed: {str(e)}", exc_info=True)
+                        await assistant.say("I encountered an error while trying to transfer your call. Please try again.", allow_interruptions=True)
+                
+                elif message in ["no", "nope", "not now", "nah"]:
+                    await assistant.say("Alright, is there something else I can help you with?", allow_interruptions=True)
+                else:
+                    await assistant.say("Would you like me to transfer you to our billing department? Please say 'yes' or 'no'.", allow_interruptions=True)
+                    
+            except Exception as e:
+                logger.error(f"Error in process_speech: {str(e)}", exc_info=True)
+                await assistant.say("I encountered an unexpected error. Please try again.", allow_interruptions=True)
+
+        # Create and run the async task
+        asyncio.create_task(process_speech())
+
+    # Register the synchronous event handlers
+    assistant.on("user_speech_committed", handle_user_speech)
+
+    def on_user_started_speaking():
+        logger.info("User started speaking")
+
+    def on_user_stopped_speaking():
+        logger.info("User stopped speaking")
+
+    def on_agent_interrupted():
+        logger.info("Agent was interrupted")
+
+    # Register the debug event handlers
+    assistant.on("user_started_speaking", on_user_started_speaking)
+    assistant.on("user_stopped_speaking", on_user_stopped_speaking)
+    assistant.on("agent_speech_interrupted", on_agent_interrupted)
+
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    print(f"Room name is: {ctx.room.name}")
+    organizationId = ctx.room.name.replace("call-","")
+    print(f"organizationId is: {organizationId}")
+    context = await fetch_context_from_organization_id(organizationId)
+    print(f"Context is: {context}")
+    initial_ctx.append(
+        role="system", 
+        text=context,
+    )
+
+    # Start the assistant and send greeting
+    assistant.start(ctx.room)
     await asyncio.sleep(1)
 
-    # Updated greeting to remove DTMF options
     greeting = (
         "Hey, how can I help you today? If you need to speak with our billing department, "
         "just let me know by saying 'yes', and I'll transfer you right away."
     )
     await assistant.say(greeting, allow_interruptions=True)
-
-    # Set up a message handler for the assistant
-    @assistant.on_message
-    async def handle_message(message: str):
-        message = message.lower().strip()
-        
-        if message in ["yes", "yeah", "sure", "okay", "correct", "yep"]:
-            participants = list(ctx.room.participants.values())
-            if not participants:
-                logger.error("No participants found in room")
-                await assistant.say("I'm sorry, but I cannot process the transfer at this moment.", allow_interruptions=True)
-                return
-
-            participant = participants[0]
-            logger.info(f"Attempting transfer for participant: {participant.identity}")
-            await handle_transfer(ctx.room.name, participant.identity, assistant)
-            
-        elif message in ["no", "nope", "not now", "nah"]:
-            await assistant.say("Alright, is there something else I can help you with?", allow_interruptions=True)
-        else:
-            await assistant.say("Would you like me to transfer you to our billing department? Please say 'yes' or 'no'.", allow_interruptions=True)
 
     # Keep the agent running
     while True:
