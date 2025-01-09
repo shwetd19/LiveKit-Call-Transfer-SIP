@@ -9,6 +9,7 @@ from livekit.protocol import sip as proto_sip
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+import re
 
 def load_environment():
     """
@@ -183,12 +184,14 @@ async def entrypoint(ctx: JobContext):
                 else:
                     message = str(msg.content)
                 
-                message = message.lower().strip()
+                # Clean up the message by removing punctuation and extra whitespace
+                message = re.sub(r'[^a-zA-Z0-9\s]', '', message.lower().strip())
                 logger.info(f"Processed message: '{message}'")
                 
                 if message in ["yes", "yeah", "sure", "okay", "correct", "yep"]:
                     logger.info("Positive response detected, initiating transfer")
-                    participants = list(ctx.room.participants.values())
+                    # Use remote_participants instead of participants
+                    participants = list(ctx.room.remote_participants.values())
                     
                     if not participants:
                         logger.error("No participants found in room")
@@ -263,10 +266,6 @@ async def entrypoint(ctx: JobContext):
         "just let me know by saying 'yes', and I'll transfer you right away."
     )
     await assistant.say(greeting, allow_interruptions=True)
-
-    # Keep the agent running
-    while True:
-        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     # logger.info("Starting LiveKit AI Agent")
