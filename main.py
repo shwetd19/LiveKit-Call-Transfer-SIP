@@ -1,25 +1,27 @@
+from __future__ import annotations
 import asyncio
 import logging
+import os
+from typing import Annotated, Optional
 import aiohttp
+from dotenv import load_dotenv
+from livekit import rtc, api
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
 from livekit.agents.voice_assistant import VoiceAssistant
-from livekit.plugins import deepgram, openai, silero
-from livekit import api, rtc
 from livekit.protocol import sip as proto_sip
-import os
-from dotenv import load_dotenv
-from pathlib import Path
+from livekit.plugins import deepgram, openai, silero
 import re
+from pathlib import Path
+from datetime import datetime
+
+# Initialize logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("voice-assistant")
+logger.setLevel(logging.INFO)
 
 def load_environment():
-    """
-    Load environment variables from available .env files
-    Returns True if successful, False if no environment files could be loaded
-    """
-    # Get the current script's directory
+    """Load environment variables from available .env files"""
     current_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-    
-    # Define potential env file locations
     env_files = [
         current_dir / '.env.local',
         current_dir / '.env',
@@ -28,8 +30,6 @@ def load_environment():
     ]
     
     env_loaded = False
-    
-    # Try loading each env file in order
     for env_file in env_files:
         if env_file.exists():
             try:
@@ -39,235 +39,319 @@ def load_environment():
                 break
             except Exception as e:
                 logger.error(f"Error loading {env_file}: {str(e)}")
-                continue
     
     if not env_loaded:
         logger.error("No environment files could be loaded!")
         return False
     
-    # Verify critical environment variables
     required_vars = [
         'LIVEKIT_URL',
         'LIVEKIT_API_KEY',
         'LIVEKIT_API_SECRET',
         'OPENAI_API_KEY',
-        'BILLING_PHONE_NUMBER'
+        'BILLING_PHONE_NUMBER',
+        'CAL_API_KEY',
+        'CAL_EVENT_TYPE_ID'
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
     if missing_vars:
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         return False
     
-    logger.info("Environment loaded successfully with all required variables")
     return True
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
-# Replace the simple load_dotenv call with the new function
-if not load_environment():
-    logger.error("Failed to load required environment variables")
-    exit(1)
-
-# Simplified to just one department
-TRANSFER_CONFIG = {
-    "PHONE_NUMBER": ("BILLING_PHONE_NUMBER", "Billing")
-}
-
-async def fetch_context_from_organization_id(organizationId:str) -> str:
-    logger.info(f"Fetching context for organization ID: {organizationId}")
-    async with aiohttp.ClientSession() as session:
-        url = f"https://openmic-webfront-test.vercel.app/api/getContextOfUser?organizationId={organizationId}"
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data.get("context", "Unknown")
-            else:
-                logger.error(f"Failed to fetch context: {response.status}")
-                return "Unknown"
+class CalendarFunctions(llm.FunctionContext):
+    def __init__(self):
+        # Call parent class's __init__ first
+        super().__init__()
+        
+        # Initialize Cal.com specific attributes
+        self.api_key = os.getenv('CAL_API_KEY')
+        self.event_type_id = os.getenv('CAL_EVENT_TYPE_ID')
+        self.base_url = 'https://api.cal.com/v1'
+        
+    @llm.ai_callable()
+    async def schedule_appointment(
+        self,
+        date: Annotated[str, llm.TypeInfo(description="The preferred date for the appointment (YYYY-MM-DD)")],
+        time: Annotated[str, llm.TypeInfo(description="The preferred time for the appointment (HH:MM)")],
+        name: Annotated[str, llm.TypeInfo(description="Customer's full name")],
+        email: Annotated[str, llm.TypeInfo(description="Customer's email address")],
+        notes: Annotated[Optional[str], llm.TypeInfo(description="Any additional notes for the appointment")] = None
+    ) -> str:
+        """Schedule an appointment on Cal.com when a user requests to book a meeting."""
+        try:
+            # Construct the datetime string
+            start_time = f"{date}T{time}:00Z"
             
+            # Prepare the booking payload
+            payload = {
+                "eventTypeId": int(self.event_type_id),
+                "start": start_time,
+                "email": email,
+                "name": name,
+                "notes": notes or "",
+                "language": "en"
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/bookings",
+                    json=payload,
+                    headers=headers
+                ) as response:
+                    if response.status == 201:
+                        data = await response.json()
+                        return f"Successfully scheduled appointment for {name} on {date} at {time}."
+                    else:
+                        error_data = await response.text()
+                        logger.error(f"Failed to schedule appointment: {error_data}")
+                        return f"Failed to schedule the appointment. Status: {response.status}"
+                        
+        except Exception as e:
+            logger.error(f"Error scheduling appointment: {e}")
+            return f"An error occurred while scheduling the appointment: {str(e)}"
 
-async def handle_transfer(room_name: str, participant_identity: str, assistant: VoiceAssistant) -> None:
-    """
-    Handle the transfer process with voice confirmation and SIP REFER.
-    """
-    try:
-        # Get the transfer number from environment
-        transfer_number = os.getenv('BILLING_PHONE_NUMBER')
-        if not transfer_number:
-            raise ValueError("Billing phone number not configured")
+class VoiceTransferAssistant:
+    def __init__(self, context: JobContext):
+        self.context = context
+        self.assistant = None
+        self.livekit_api = None
+        self.transfer_in_progress = False
+        self.calendar_functions = CalendarFunctions()
 
-        # Ensure transfer_number starts with + if it's not already formatted
-        if not transfer_number.startswith('+'):
-            transfer_number = f"+{transfer_number}"
+    async def initialize(self) -> bool:
+        """Initialize the assistant and API client"""
+        try:
+            # Initialize LiveKit API
+            livekit_url = os.getenv('LIVEKIT_URL')
+            api_key = os.getenv('LIVEKIT_API_KEY')
+            api_secret = os.getenv('LIVEKIT_API_SECRET')
+            
+            logger.debug(f"Initializing LiveKit API client with URL: {livekit_url}")
+            self.livekit_api = api.LiveKitAPI(
+                url=livekit_url,
+                api_key=api_key,
+                api_secret=api_secret
+            )
 
-        await assistant.say("Transferring you to our billing department. Please hold.", allow_interruptions=False)
-        
-        # Initialize LiveKit API client
-        livekit_api = api.LiveKitAPI(
-            url=os.getenv('LIVEKIT_URL'),
-            api_key=os.getenv('LIVEKIT_API_KEY'),
-            api_secret=os.getenv('LIVEKIT_API_SECRET')
-        )
+            # Create initial chat context
+            initial_ctx = llm.ChatContext().append(
+                role="system",
+                text=(
+                    "You are a voice assistant with two main capabilities:\n"
+                    "1. Handling transfers to the billing department\n"
+                    "2. Scheduling appointments\n\n"
+                    "For billing transfers:\n"
+                    "- If a user says 'yes', initiate a transfer to the billing department\n"
+                    "- If they say 'no', ask if there's anything else you can help with\n\n"
+                    "For scheduling appointments:\n"
+                    "- When users want to schedule, collect their name, email, preferred date, and time\n"
+                    "- Use natural conversation to gather this information\n"
+                    "- Once you have all details, use the schedule_appointment function\n\n"
+                    "General behavior:\n"
+                    "- Keep responses concise and natural\n"
+                    "- Introduce yourself at the start and offer both services\n"
+                    "- Listen carefully for 'yes' or 'no' responses when asking about transfers"
+                )
+            )
 
-        # Format the transfer number with SIP URI format and domain
-        transfer_uri = f"sip:{transfer_number}@sip.livekit.io"
-        
-        logger.info(f"Preparing transfer request for {participant_identity} to {transfer_uri}")
-        
-        # Create transfer request with explicit parameters
-        transfer_request = proto_sip.TransferSIPParticipantRequest()
-        transfer_request.room_name = room_name
-        transfer_request.participant_identity = participant_identity
-        transfer_request.transfer_to = transfer_uri
+            # Initialize voice assistant
+            self.assistant = VoiceAssistant(
+                vad=silero.VAD.load(),
+                stt=deepgram.STT(),
+                llm=openai.LLM(),
+                tts=openai.TTS(),
+                chat_ctx=initial_ctx,
+                fnc_ctx=self.calendar_functions,
+                allow_interruptions=True,
+                interrupt_speech_duration=0.5,
+                min_endpointing_delay=0.5,
+            )
 
-        logger.info(f"Executing transfer request: {transfer_request}")
-        
-        # Execute transfer and capture response
-        response = await livekit_api.sip.transfer_sip_participant(transfer_request)
-        logger.info(f"Transfer API response: {response}")
-        
-        # Wait for transfer to process
-        await asyncio.sleep(2)
-        
-        # Stop the assistant before cleanup
-        await assistant.stop()
-        await assistant.cleanup()
-        
-        logger.info("Transfer completed successfully")
-        
-        # Exit process after successful transfer
-        os._exit(0)
+            return True
+        except Exception as e:
+            logger.error(f"Initialization failed: {e}", exc_info=True)
+            return False
 
-    except Exception as e:
-        logger.error(f"Transfer failed with exception: {str(e)}", exc_info=True)
-        await assistant.say("I apologize, but I couldn't transfer your call. Please try again later.", allow_interruptions=True)
-        return False
+    async def transfer_call(self, participant_identity: str) -> bool:
+        """Transfer the call using tel: format"""
+        if self.transfer_in_progress:
+            logger.warning("Transfer already in progress")
+            return False
 
-async def entrypoint(ctx: JobContext):
-    # Create an initial chat context with a system prompt
-    initial_ctx = llm.ChatContext().append(
-        role="system",
-        text=(
-            "You are a voice assistant created by Attack Capital. Your interface with users is voice, and you should "
-            "respond with short, concise, and natural language. You are polite, helpful, and always ready to assist. "
-            "If a user says 'yes', initiate a transfer to the billing department. "
-            "If they say 'no', ask if there's anything else you can help with. "
-            "At the start of a conversation, introduce yourself and offer your assistance. "
-            "Listen carefully for 'yes' or 'no' responses when asking about transfers."
-        ),
-    )
+        try:
+            self.transfer_in_progress = True
+            transfer_to = os.getenv('BILLING_PHONE_NUMBER')
+            if not transfer_to:
+                logger.error("Billing phone number not configured")
+                return False
 
-    # Create VoiceAssistant with explicit API key configuration
-    assistant = VoiceAssistant(
-        vad=silero.VAD.load(),
-        stt=deepgram.STT(),
-        llm=openai.LLM(),
-        tts=openai.TTS(),
-        chat_ctx=initial_ctx,
-        allow_interruptions=True,
-        interrupt_speech_duration=0.5,
-        min_endpointing_delay=0.5,
-    )
+            # Format transfer number
+            if not transfer_to.startswith('+'):
+                transfer_to = f"+{transfer_to}"
 
-    # Set up event handlers
-    def handle_user_speech(msg: llm.ChatMessage):
+            # Use tel: format for transfer
+            transfer_uri = f"tel:{transfer_to}"
+            logger.info(f"Transferring call for participant {participant_identity} to {transfer_uri}")
+
+            # Create transfer request
+            transfer_request = proto_sip.TransferSIPParticipantRequest(
+                participant_identity=participant_identity,
+                room_name=self.context.room.name,
+                transfer_to=transfer_uri,
+                play_dialtone=True
+            )
+            logger.debug(f"Transfer request: {transfer_request}")
+
+            # Execute transfer
+            await self.livekit_api.sip.transfer_sip_participant(transfer_request)
+            logger.info(f"Successfully transferred participant {participant_identity}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to transfer call: {e}", exc_info=True)
+            return False
+        finally:
+            self.transfer_in_progress = False
+
+    def handle_user_speech(self, msg: llm.ChatMessage):
         async def process_speech():
             try:
-                logger.info(f"Processing user speech: {msg.content}")
-                
+                # Process the message
                 if isinstance(msg.content, list):
                     message = " ".join(str(x) for x in msg.content if not isinstance(x, llm.ChatImage))
                 else:
                     message = str(msg.content)
                 
-                # Clean up the message by removing punctuation and extra whitespace
                 message = re.sub(r'[^a-zA-Z0-9\s]', '', message.lower().strip())
-                logger.info(f"Processed message: '{message}'")
+                logger.info(f"Processed voice input: '{message}'")
                 
+                # Handle positive responses for billing transfer
                 if message in ["yes", "yeah", "sure", "okay", "correct", "yep"]:
-                    logger.info("Positive response detected, initiating transfer")
-                    # Use remote_participants instead of participants
-                    participants = list(ctx.room.remote_participants.values())
-                    
+                    participants = list(self.context.room.remote_participants.values())
                     if not participants:
-                        logger.error("No participants found in room")
-                        await assistant.say("I'm sorry, but I cannot process the transfer at this moment.", allow_interruptions=True)
+                        logger.error("No participants found")
+                        await self.assistant.say("I cannot process the transfer right now.", allow_interruptions=True)
                         return
 
                     participant = participants[0]
-                    logger.info(f"Found participant: {participant.identity}")
+                    logger.info(f"Starting transfer for participant: {participant.identity}")
                     
-                    # Create transfer task
-                    transfer_task = asyncio.create_task(
-                        handle_transfer(ctx.room.name, participant.identity, assistant)
-                    )
+                    # Notify user
+                    await self.assistant.say("Transferring you to billing. Please hold.", allow_interruptions=False)
+                    await asyncio.sleep(1)
                     
-                    try:
-                        # Wait for transfer with timeout
-                        await asyncio.wait_for(transfer_task, timeout=15.0)
-                    except asyncio.TimeoutError:
-                        logger.error("Transfer operation timed out")
-                        await assistant.say("I'm sorry, the transfer is taking longer than expected. Please try again.", allow_interruptions=True)
-                    except Exception as e:
-                        logger.error(f"Transfer task failed: {str(e)}", exc_info=True)
-                        await assistant.say("I encountered an error while trying to transfer your call. Please try again.", allow_interruptions=True)
+                    # Execute transfer
+                    transfer_success = await self.transfer_call(participant.identity)
+                    
+                    if transfer_success:
+                        logger.info("Transfer completed successfully")
+                        await self.assistant.stop()
+                    else:
+                        await self.assistant.say("I couldn't complete the transfer. Please try again.", allow_interruptions=True)
                 
                 elif message in ["no", "nope", "not now", "nah"]:
-                    await assistant.say("Alright, is there something else I can help you with?", allow_interruptions=True)
+                    await self.assistant.say("Would you like to schedule an appointment instead?", allow_interruptions=True)
                 else:
-                    await assistant.say("Would you like me to transfer you to our billing department? Please say 'yes' or 'no'.", allow_interruptions=True)
-                    
-            except Exception as e:
-                logger.error(f"Error in process_speech: {str(e)}", exc_info=True)
-                await assistant.say("I encountered an unexpected error. Please try again.", allow_interruptions=True)
+                    # Let the assistant process the message naturally, which may trigger appointment scheduling
+                    response = await self.assistant.process_message(message)
+                    if response:
+                        await self.assistant.say(response, allow_interruptions=True)
 
-        # Create and run the async task
+            except Exception as e:
+                logger.error(f"Speech processing error: {str(e)}", exc_info=True)
+                await self.assistant.say("I encountered an error. Please try again.", allow_interruptions=True)
+
+        # Create and run the speech processing task
         asyncio.create_task(process_speech())
 
-    # Register the synchronous event handlers
-    assistant.on("user_speech_committed", handle_user_speech)
+    async def fetch_context(self):
+        """Fetch organization context"""
+        try:
+            organization_id = self.context.room.name.replace("call-", "")
+            logger.info(f"Fetching context for organization ID: {organization_id}")
+            if self.assistant and hasattr(self.assistant, 'chat_ctx'):
+                self.assistant.chat_ctx.append(
+                    role="system",
+                    text=f"Organization ID: {organization_id}"
+                )
+        except Exception as e:
+            logger.error(f"Error fetching context: {e}")
 
-    def on_user_started_speaking():
-        logger.info("User started speaking")
+    async def start(self):
+        """Start the assistant and set up event handlers"""
+        try:
+            # Connect to room
+            await self.context.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    def on_user_stopped_speaking():
-        logger.info("User stopped speaking")
+            # Register event handlers
+            if self.assistant:
+                self.assistant.on("user_speech_committed", self.handle_user_speech)
+                self.assistant.on("user_started_speaking", lambda: logger.info("User started speaking"))
+                self.assistant.on("user_stopped_speaking", lambda: logger.info("User stopped speaking"))
+                self.assistant.on("agent_speech_interrupted", lambda: logger.info("Agent was interrupted"))
 
-    def on_agent_interrupted():
-        logger.info("Agent was interrupted")
+                # Start assistant
+                self.assistant.start(self.context.room)
+                await asyncio.sleep(1)
 
-    # Register the debug event handlers
-    assistant.on("user_started_speaking", on_user_started_speaking)
-    assistant.on("user_stopped_speaking", on_user_stopped_speaking)
-    assistant.on("agent_speech_interrupted", on_agent_interrupted)
+                # Fetch context and send greeting
+                await self.fetch_context()
+                greeting = (
+                    "Hello! I can help you schedule an appointment or connect you with billing. "
+                    "For billing matters, just say 'yes' and I'll transfer you. "
+                    "Would you like to schedule an appointment or speak with billing?"
+                )
+                await self.assistant.say(greeting, allow_interruptions=True)
 
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+        except Exception as e:
+            logger.error(f"Error starting assistant: {e}", exc_info=True)
 
-    print(f"Room name is: {ctx.room.name}")
-    organizationId = ctx.room.name.replace("call-","")
-    print(f"organizationId is: {organizationId}")
-    context = await fetch_context_from_organization_id(organizationId)
-    print(f"Context is: {context}")
-    initial_ctx.append(
-        role="system", 
-        text=context,
-    )
+    async def cleanup(self):
+        """Clean up resources"""
+        try:
+            if self.livekit_api:
+                await self.livekit_api.aclose()
+                self.livekit_api = None
+            if self.assistant:
+                await self.assistant.stop()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}", exc_info=True)
 
-    # Start the assistant and send greeting
-    assistant.start(ctx.room)
-    await asyncio.sleep(1)
+async def entrypoint(context: JobContext):
+    """Main entry point"""
+    # Load environment variables
+    if not load_environment():
+        logger.error("Failed to load required environment variables")
+        return
 
-    greeting = (
-        "Hey, how can I help you today? If you need to speak with our billing department, "
-        "just let me know by saying 'yes', and I'll transfer you right away."
-    )
-    await assistant.say(greeting, allow_interruptions=True)
+    assistant = VoiceTransferAssistant(context)
+    
+    if not await assistant.initialize():
+        logger.error("Failed to initialize assistant")
+        return
+
+    disconnect_event = asyncio.Event()
+
+    @context.room.on("disconnected")
+    def on_room_disconnect(*args):
+        disconnect_event.set()
+
+    try:
+        await assistant.start()
+        await disconnect_event.wait()
+    finally:
+        await assistant.cleanup()
 
 if __name__ == "__main__":
-    # logger.info("Starting LiveKit AI Agent")
-    # Initialize the worker with the entrypoint
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+
+
+
