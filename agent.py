@@ -66,8 +66,8 @@ class CalendarFunctions(llm.FunctionContext):
         super().__init__()
         
         # Initialize Cal.com specific attributes
-        self.api_key = os.getenv('CAL_API_KEY')
-        self.event_type_id = os.getenv('CAL_EVENT_TYPE_ID')
+        self.api_key = 'cal_live_c2e5fd9e9320c8995503c67ba9fb6496'
+        self.event_type_id = '1659032'
         self.base_url = 'https://api.cal.com/v1'
         
     @llm.ai_callable()
@@ -245,58 +245,57 @@ class VoiceTransferAssistant:
             self.transfer_in_progress = False
 
     def handle_user_speech(self, msg: llm.ChatMessage):
-        async def process_speech():
-            try:
-                # Process the message
-                if isinstance(msg.content, list):
-                    message = " ".join(str(x) for x in msg.content if not isinstance(x, llm.ChatImage))
-                else:
-                    message = str(msg.content)
-                
-                message = re.sub(r'[^a-zA-Z0-9\s]', '', message.lower().strip())
-                logger.info(f"Processed voice input: '{message}'")
-                
-                # Handle positive responses for billing transfer
-                if message in ["yes", "yeah", "sure", "okay", "correct", "yep"]:
-                    participants = list(self.context.room.remote_participants.values())
-                    if not participants:
-                        logger.error("No participants found")
-                        await self.assistant.say("I cannot process the transfer right now.", allow_interruptions=True)
-                        return
-
-                    participant = participants[0]
-                    logger.info(f"Starting transfer for participant: {participant.identity}")
-                    
-                    # Notify user
-                    await self.assistant.say("Transferring you to billing. Please hold.", allow_interruptions=False)
-                    await asyncio.sleep(1)
-                    
-                    # Execute transfer
-                    transfer_success = await self.transfer_call(participant.identity)
-                    
-                    if transfer_success:
-                        logger.info("Transfer completed successfully")
-                        await self.cleanup()
+            async def process_speech():
+                try:
+                    # Process the message
+                    if isinstance(msg.content, list):
+                        message = " ".join(str(x) for x in msg.content if not isinstance(x, llm.ChatImage))
                     else:
-                        await self.assistant.say("I couldn't complete the transfer. Please try again.", allow_interruptions=True)
-                
-                elif message in ["no", "nope", "not now", "nah"]:
-                    await self.assistant.say("Would you like to schedule an appointment instead?", allow_interruptions=True)
-                else:
-                    # Use LLM directly for message processing
-                    response = await self.assistant.llm.complete(
-                        messages=[{"role": "user", "content": message}],
-                        context=self.assistant.chat_ctx
-                    )
-                    if response and response.content:
-                        await self.assistant.say(response.content, allow_interruptions=True)
+                        message = str(msg.content)
+                    
+                    message = re.sub(r'[^a-zA-Z0-9\s]', '', message.lower().strip())
+                    logger.info(f"Processed voice input: '{message}'")
+                    
+                    # Handle positive responses for billing transfer
+                    if message in ["yes", "yeah", "sure", "okay", "correct", "yep"]:
+                        participants = list(self.context.room.remote_participants.values())
+                        if not participants:
+                            logger.error("No participants found")
+                            await self.assistant.say("I cannot process the transfer right now.", allow_interruptions=True)
+                            return
 
-            except Exception as e:
-                logger.error(f"Speech processing error: {str(e)}", exc_info=True)
-                await self.assistant.say("I encountered an error. Please try again.", allow_interruptions=True)
+                        participant = participants[0]
+                        logger.info(f"Starting transfer for participant: {participant.identity}")
+                        
+                        # Notify user
+                        await self.assistant.say("Transferring you to billing. Please hold.", allow_interruptions=False)
+                        await asyncio.sleep(1)
+                        
+                        # Execute transfer
+                        transfer_success = await self.transfer_call(participant.identity)
+                        
+                        if transfer_success:
+                            logger.info("Transfer completed successfully")
+                            await self.cleanup_resources()
+                        else:
+                            await self.assistant.say("I couldn't complete the transfer. Please try again.", allow_interruptions=True)
+                    
+                    elif message in ["no", "nope", "not now", "nah"]:
+                        await self.assistant.say("Would you like to schedule an appointment instead?", allow_interruptions=True)
+                    else:
+                        # Use chat completion instead of direct LLM completion
+                        messages = [{"role": "user", "content": message}]
+                        response = await self.assistant.llm.chat.completions.create(
+                            messages=messages,
+                            model="gpt-4",  # or your preferred model
+                            context=self.assistant.chat_ctx
+                        )
+                        if response and response.choices and response.choices[0].message:
+                            await self.assistant.say(response.choices[0].message.content, allow_interruptions=True)
 
-        # Create and run the speech processing task
-        asyncio.create_task(process_speech())
+                except Exception as e:
+                    logger.error(f"Speech processing error: {str(e)}", exc_info=True)
+                    await self.assistant.say("I encountered an error. Please try again.", allow_interruptions=True)
 
     async def cleanup(self):
         """Clean up resources"""
